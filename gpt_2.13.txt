@@ -1,0 +1,143 @@
+[Reproduction Status Summary — Unsupervised Anomaly Detection Improves]
+
+Goal:
+Implement the paper’s unsupervised anomaly detection pipeline for filtering abnormal images (raindrop) from a mixed driving dataset (16000 clean + 1600 dirty), using a convolutional autoencoder (CAE) with latent reference loss, then export filtering results to an .npz file.
+
+What has been implemented (aligned with the paper):
+1) Dataset:
+- Built a mixed dataset: 16000 clean + 1600 raindrop images.
+- Images resized to 224x224, converted to float in [0,1], NCHW format.
+- For visualization/debug, dirty samples are placed at the end of the dataset (index >= 16000).
+
+2) Model:
+- Implemented a CAE with latent_dim=256.
+- Forward: x -> encoder -> z; decoder(z) -> x_rec.
+
+3) Training (100 epochs):
+- Loss: L = L_rec + λ * L_ref, where:
+  - L_rec: pixel-level MSE between x and x_rec.
+  - L_ref: latent reference loss based on nearest neighbor in a reference latent set H_ref.
+- Each epoch rebuilds H_ref by randomly sampling M_ref=1024 points and encoding them.
+- Optimizer: Adam, lr=5e-4; λ=1.0; batch size followed the notebook setup.
+
+4) Scoring + Filtering:
+- Computed reconstruction PCC for each sample, then applied a 1D median filter (k=101) to obtain PCC_med.
+- Used the paper’s threshold rule: δ = median(PCC_med) - 0.05; classify as dirty if PCC_med < δ.
+- Exported results into an NPZ file (keys include: pcc, pcc_med, delta, is_clean).
+
+Key debug observations (current issue):
+1) PCC_med behavior is opposite to the paper’s expectation:
+- PCC_med shows an upward jump when entering the dirty segment (after index ~16000), rather than a drop.
+- This leads to poor separability between clean and dirty using “lower PCC => anomaly”.
+
+2) Threshold δ becomes too low, causing all samples to be kept:
+- Example: median(PCC_med) ≈ 0.977 -> δ ≈ 0.927.
+- PCC_med values stay around ~0.97–0.986, so PCC_med is always > δ.
+- Result: kept ratio = 1.0; dirty kept ratio = 1.0 (no filtering).
+
+3) MSE does not separate clean vs dirty either (even reversed trend):
+- Observed median MSE(clean) > median MSE(dirty), i.e., dirty reconstruction error is not larger.
+
+4) Visual inspection:
+- Orig vs recon pairs show raindrop-like residuals in |orig - recon|*5 maps, meaning anomalies exist visually,
+  but current scalar metrics (PCC/MSE) are not producing a clean/dirty separation.
+
+Conclusion:
+- The full training + scoring pipeline runs successfully and NPZ export is working.
+- However, the anomaly score direction/separability is not reproduced yet (dirty is not pushed to lower PCC/higher error),
+  so filtering with the paper’s threshold rule fails (keeps all data).
+
+
+1) 论文的 PCC 检测规则在我这边不触发
+
+按论文流程算了 PCC(x, xrec)，再做 median filter 得到 PCC_med，阈值用
+
+𝛿=median(𝑃𝐶𝐶_𝑚𝑒𝑑)−0.05
+δ=median(PCC_med)−0.05（论文的设置）。
+
+Unsupervised Anomaly Detection …
+
+结果：delta ≈ 0.9271，但 PCC_med 全程大约在 0.975~0.986，因此 is_clean 全 True，17600/17600 全保留。
+
+2) 更“反直觉”的现象：dirty 段指标反而更好
+
+从 PCC_med vs index 图看：在 index=16000（clean/dirty 分界）后，曲线 整体上跳（dirty 段 PCC_med 更高）。
+
+从 MSE(x, xrec) vs index 图看：dirty 段 整体更低（重建误差更小）。
+
+3) 分布统计证据（非常关键）
+
+你画的直方图 + median 直接说明两类是“分开且方向相反”：
+
+PCC median：clean 0.9770 < dirty 0.9847
+
+MSE median：clean 0.001022 > dirty 0.000713
+⇒ 模型对 dirty（raindrop）更容易重建，所以 “低 PCC / 高误差 = 异常” 的假设不成立。
+
+4) 视觉证据（定性）
+
+随机抽取 dirty 的“原图 vs 重建”能看到 raindrop/雾状区域；
+
+residual（∣𝑥−𝑥𝑟𝑒𝑐∣∣x−xrec∣）图中该区域确实更亮，说明局部差异存在；
+
+但全局 PCC 依然很高，说明 局部异常没有显著拉低全局相关系数。
+
+5) 当前阶段结论
+
+目前的复现结果表明：在你这套数据/模型设置下，raindrop 并没有表现为“更难重建的异常”，反而更像一种“更平滑、易重建”的模式，因此论文的 PCC 阈值过滤步骤不会筛掉 dirty。
+
+6) 已完成产出
+
+已生成并保存 filter_result_raindrop.npz（包含 pcc, pcc_med, mse, delta, is_clean），后续无需重复计算。
+
+现在的情况：代码跑通了，但“按论文的判别逻辑过滤 dirty”的效果还没复现出来——所以不是“失败=跑不起来”，而是**“结果和论文预期相反/不分离”**。
+
+论文的核心预期是：加了 latent reference loss 后，dirty 的重建会更差 → PCC 更低（或误差更高），然后用 median filter + 阈值把它们筛掉。论文明确写了用 PCC + 中值滤波，并用 δ = median(PCC_med) - 0.05 做阈值。
+
+Unsupervised Anomaly Detection …
+
+
+
+
+
+
+1) 你目前跑出来的现象（debug 结论）
+
+从你截图里能读到几个关键事实：
+
+PCC_med 在 dirty 段反而“更高”
+你的 PCC_med 曲线在 index≈16000（dirty 开始）出现明显上跳，而不是论文图里那种“掉下去”。
+所以如果你用论文阈值逻辑（PCC_med < δ → dirty），就会出现：dirty 全部在阈值之上 → 一个都筛不掉。
+
+阈值 δ 被算得太低，导致必然全保留
+你算出来 median(PCC_med)≈0.977，所以 δ≈0.927（0.977-0.05）。
+但你的 PCC_med 全程都在 ~0.97~0.986 之间波动，当然 全部 > 0.927，所以 kept ratio=1.0 是必然结果。
+
+MSE 也没有按预期拉开，甚至 dirty 的 MSE 中位数更小
+你打印了 MSE median clean/dirty: 0.00102 vs 0.000713（dirty 更低），这和“dirty 重建更差”的直觉/论文结论相反。
+
+可视化确实能看到 raindrop 的残留/差异图
+你贴的 |orig-recon|*5 差异图里能看到类似 raindrop/纹理残差，说明：
+
+模型不是完全学会把异常“抹平”，
+
+但你用的 PCC/MSE 指标在全局统计上并没有把 dirty 推到更“差”的分布。
+
+2) 所以我们是“失败了吗”？
+
+结论：还没复现论文“可分离的 anomaly score”，但 pipeline 已经跑通。
+
+你已经完成了论文流程里最关键的工程部分：
+
+MixDataset（16000 clean + 1600 raindrop，224×224，归一化到[0,1]）
+
+CAE（latent_dim=256）
+
+训练：L = Lrec + λ Lref，每 epoch 重建 H_ref
+
+推理：算 PCC、median filter（k=101）、阈值 δ、导出 npz
+这些都对齐论文描述。
+
+Unsupervised Anomaly Detection …
+
+但目前**“判别信号方向不对/分布不分离”**，导致过滤失败（全保留）。

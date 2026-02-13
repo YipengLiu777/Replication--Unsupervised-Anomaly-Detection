@@ -1,0 +1,157 @@
+你这次 CAE 100 epoch 已经跑完 了，而且最后也把 PCC + 阈值 + 过滤结果 算出来并保存成 filter_result_raindrop.npz 了 ✅
+（论文整体逻辑就是：先用 CAE 做无监督异常检测 → 过滤掉异常帧 → 再用过滤后的数据训练行为克隆 BC 控制器。）
+
+Unsupervised Anomaly Detection …
+
+1) 你现在输出这些数字，分别说明什么？
+
+你最后一屏关键信息：
+
+PCC raw: 0.9196 0.9856 median: 0.9702
+
+表示所有帧的重建 PCC（相关系数）大概范围在 0.92~0.99，整体中位数 0.97，说明 整体重建都挺像。
+
+threshold delta: 0.92017806
+
+你现在的阈值是：delta = median(PCC_medfilt) - 0.05（论文就是这么定的）。
+
+Unsupervised Anomaly Detection …
+
+kept(clean) ratio: 1.0 kept num: 17600 total: 17600
+
+这里非常关键：你把 17600 张全都保留了，也就是 没有过滤掉任何异常帧。
+
+👉 这不一定是“坏事”，但它告诉我们：按你现在的阈值规则，dirty 帧的 PCC 也没有低到阈值以下，所以检测没触发。
+
+2) 你目前完成了哪些工作（可以讲给别人听的版本）
+Step A：把数据变成 CAE 能训练的输入
+
+读入 16000 clean + 1600 raindrop（总 17600）
+
+归一化到 [0,1]
+
+转成 PyTorch 需要的 NCHW，即 (N,3,224,224)
+
+DataLoader 正常出 batch
+
+Step B：实现 CAE（卷积自编码器）并确认 forward 形状
+
+x -> encoder -> z(256维) -> decoder -> xrec
+
+你验证过：xrec.shape == x.shape，z.shape == (B,256)（完全正确）
+
+Step C：实现论文的核心损失：
+
+总损失：L = Lrec + λ * Lref 
+
+Unsupervised Anomaly Detection …
+
+Lrec：像素级 MSE，让模型学会重建输入
+
+Lref（latent reference loss）：
+
+每个 epoch 先从数据里随机抽 M_REF 张作为参考集 Drefer
+
+把它们过 encoder 得到 H_refer
+
+对每个 batch 的 z，在 H_refer 里找最近邻 z_near
+
+Lref = MSE(z, z_near)
+
+直觉：异常帧也会被“拉向”正常参考 latent，导致它们在 decoder 里更难被重建好 → 从而 PCC 变低，更容易被检测出来。
+
+Unsupervised Anomaly Detection …
+
+Step D：训练 100 epoch
+
+你日志里 Lrec 持续下降，说明训练稳定。
+
+Step E：用 PCC 做检测 + median filter + 阈值
+
+对每张图计算 PCC(x, xrec)，然后做 window=100 的 median filter（论文就是为了避免正常帧场景变化造成误报）
+
+Unsupervised Anomaly Detection …
+
+阈值：delta = median(PCC_med) - 0.05 
+
+Unsupervised Anomaly Detection …
+
+最终保存过滤结果到 filter_result_raindrop.npz
+
+3) 下一步该做什么（现在进入真正“清洗是否成功”的验证）
+
+因为你现在 kept=17600，我们必须先回答一句话：
+
+dirty 的 1600 张帧，PCC 到底有没有更低？
+如果没有更低，过滤当然不会触发。
+
+下一步 Step F（强烈建议你现在就做）：对比 clean vs dirty 的 PCC
+
+你只要加一个很短的检查（不需要改训练代码）：
+
+目标：
+
+取 PCC_med 的数组（median filter 后的那条）
+
+看：
+
+前 16000（clean）均值/最小值
+
+后 1600（dirty）均值/最小值
+
+如果后 1600 的分布明显更低，就说明检测有效，只是阈值太松；
+如果两者差不多，说明 CAE 仍然把 dirty 重建得太好了（需要调超参/策略）。
+
+（你把你现在 filter_result_raindrop.npz 里存了哪些字段截图一下也行；通常会有 pcc_raw/pcc_med/keep_mask/idx_keep 之类。）
+
+4) 如果验证发现 dirty 没降下来：该怎么改（按优先级）
+
+你先做 Step F 的对比；如果确实 dirty 没掉下去，通常按这个顺序改最有效：
+
+阈值策略先换掉（最快见效）
+
+论文用 median - 0.05 是一个固定启发式。
+
+Unsupervised Anomaly Detection …
+
+你可以先用更“硬”的阈值，比如：
+
+delta = np.percentile(PCC_med, 5)（取最差 5% 当异常）
+
+或者 median - 0.02 / median - 0.03 先试试
+目的：先让过滤真的发生，跑通 pipeline。
+
+增大 Lref 的作用
+
+增大 LAMBDA_REF（比如 1 → 5）
+
+增大 M_REF（参考集越大，越容易把异常拉向正常簇）
+
+确保你确实是 “每个 epoch 重建 H_refer”（你截图里是有的 ✅）
+
+检查“顺序 + median filter”是不是把异常抹平了
+
+median filter 是对时间序列有效的：异常如果是连续的一段，会明显拉低；如果异常被打散/随机混在 clean 里，median filter 会把它们“抹平”，导致检测不触发。
+
+Unsupervised Anomaly Detection …
+
+你现在是 clean 后接 dirty（这其实更像论文画图的方式），所以理论上应该能看到末尾 drop。
+
+Step F 一做就知道是不是这个原因。
+
+5) 你问的 Step A：只改 epoch 就行吗？
+
+对，训练轮数就是你代码里的 EPOCHS。
+你截图里这一行就是控制位置：
+
+for ep in range(1, EPOCHS+1):
+
+所以 Step A 主要就是把 EPOCHS=100 改对，其他不用动（除非你还想改 batch size / lr / lambda）。
+
+你现在发我这两个东西，我就能带你“进入下一步并把过滤做成功”
+
+filter_result_raindrop.npz 里面保存的字段名（np.load(...).files 的输出截图）
+
+Step F 里 clean vs dirty 的 PCC_med 对比（哪怕只发均值/最小值）
+
+我会直接告诉你：阈值该怎么定、应该滤掉多少张，以及下一步怎么把过滤后的帧导出成 “BC 训练集”。

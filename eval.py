@@ -100,7 +100,7 @@ def main():
     model = model_cpu.to(device)
 
     # -------- compute metrics --------
-    pcc, mse = compute_pcc_mse(model, dl, device=device)
+    pcc, mse = compute_pcc_mse(model, ds, batch_size=args.batch_size, device=device,  num_workers=0)
     pcc_med = median_filter_1d(pcc, k=MED_K)
 
     nC = int(args.n_clean)

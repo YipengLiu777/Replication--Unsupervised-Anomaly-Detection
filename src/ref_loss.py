@@ -1,73 +1,67 @@
 import numpy as np
 import torch
 
+
 @torch.no_grad()
-def build_href_from_clean(
-    model,
-    dataset,
-    n_clean: int,
-    M: int = 1024,
-    batch_ref: int = 128,
-    device: torch.device = torch.device("cpu"),
-):
+def build_href_from_clean(model, dataset, n_clean: int, M: int, batch_ref: int, device):
     """
-    Build reference latent set H_ref using ONLY clean samples.
-    Assumption: dataset indices [0, n_clean) are clean.
-    Returns: H_ref on `device` in FP32
+    (旧版/半监督用法) 仅从 [0, n_clean) 采样构建 reference latent set.
+    """
+    idx = np.arange(int(n_clean))
+    return build_href_from_indices(model, dataset, idx, M=M, batch_ref=batch_ref, device=device)
+
+
+@torch.no_grad()
+def build_href_from_indices(model, dataset, indices, M: int, batch_ref: int, device):
+    """
+    (纯无监督/通用) 从给定 indices 里随机采样 M 个样本，encode 成 latent，组成 H_ref。
+
+    indices: list/np.ndarray of candidate indices
     """
     model.eval()
-    n_clean = int(n_clean)
-    M = int(M)
-    batch_ref = int(batch_ref)
+    indices = np.asarray(indices, dtype=np.int64)
+    assert indices.ndim == 1 and len(indices) > 0, "indices must be 1D non-empty"
 
-    if M > n_clean:
-        M = n_clean
-
-    idx = np.random.choice(n_clean, size=M, replace=False)
+    if len(indices) >= M:
+        choice = np.random.choice(indices, size=M, replace=False)
+    else:
+        # 候选集不够时允许有放回采样
+        choice = np.random.choice(indices, size=M, replace=True)
 
     z_list = []
     for s in range(0, M, batch_ref):
-        sub = idx[s : s + batch_ref]
-        xb = torch.stack([dataset[i][0] for i in sub], dim=0).to(device, non_blocking=True)
+        sub = choice[s : s + batch_ref]
+        xb = torch.stack([dataset[int(i)][0] for i in sub], dim=0).to(device, non_blocking=True)
 
-        # force FP32 latent for stability
+        # FP32：稳定
         with torch.cuda.amp.autocast(enabled=False):
             _, z = model(xb)
             z_list.append(z.float().detach().cpu())
 
-    H_ref_cpu = torch.cat(z_list, dim=0)  # CPU FP32
-    H_ref = H_ref_cpu.to(device, non_blocking=True)  # move to device
+    H_ref = torch.cat(z_list, dim=0).to(device, non_blocking=True)
     return H_ref
 
 
 def latent_ref_loss_knn(z: torch.Tensor, H_ref: torch.Tensor, knn_k: int = 1) -> torch.Tensor:
     """
-    Paper-like reference loss (nearest neighbor):
-        Lref = mean_i min_j ||z_i - h_j||^2
+    kNN reference loss:
+      mean_i mean_{kNN} || z_i - h_j ||^2
 
-    For stability, we also support kNN-mean (knn_k>1):
-        Lref = mean_i mean_{j in kNN(i)} ||z_i - h_j||^2
-
-    Inputs assumed on same device. Computed in FP32.
+    knn_k=1 时等价于 nearest neighbor (paper-like)
     """
     z = z.float()
     H_ref = H_ref.float()
 
-    # dist2 = ||z||^2 + ||h||^2 - 2 z h^T
-    z2 = (z * z).sum(dim=1, keepdim=True)          # (B,1)
-    h2 = (H_ref * H_ref).sum(dim=1).unsqueeze(0)   # (1,M)
-    dist2 = z2 + h2 - 2.0 * (z @ H_ref.t())        # (B,M)
+    # dist^2 = ||z||^2 + ||h||^2 - 2 z h^T
+    z2 = (z * z).sum(dim=1, keepdim=True)        # (B,1)
+    h2 = (H_ref * H_ref).sum(dim=1).unsqueeze(0) # (1,M)
+    dist2 = z2 + h2 - 2.0 * (z @ H_ref.t())      # (B,M)
     dist2 = torch.clamp(dist2, min=0.0)
 
     k = int(knn_k)
-    k = max(1, k)
+    if k < 1:
+        k = 1
     k = min(k, dist2.shape[1])
 
-    if k == 1:
-        # nearest neighbor (paper)
-        mins, _ = dist2.min(dim=1)
-        return mins.mean()
-    else:
-        # kNN mean (more stable)
-        vals, _ = torch.topk(dist2, k=k, dim=1, largest=False, sorted=False)  # (B,k)
-        return vals.mean()
+    vals, _ = torch.topk(dist2, k=k, dim=1, largest=False, sorted=False)  # (B,k)
+    return vals.mean()
